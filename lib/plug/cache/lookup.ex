@@ -1,7 +1,7 @@
 defmodule Plug.Cache.Lookup do
   import Plug.Conn
 
-  alias Plug.Cache.Storeage
+  alias Plug.Cache.Storage
   alias Plug.Cache.Response
   alias Plug.Cache.ResponseLogic
   alias Plug.Cache.CacheControl
@@ -30,7 +30,7 @@ defmodule Plug.Cache.Lookup do
   # stale, attempt to validate the entry with the backend using conditional
   # GET. When no matching cache entry is found, trigger miss processing.
   defp lookup_entry(conn, opts) do
-    case Storeage.lookup(conn, opts) do
+    case Storage.lookup(conn, opts) do
       nil -> record(conn, "miss") |> fetch(opts)
       entry -> lookup_entry(conn, opts, entry)
     end
@@ -38,7 +38,7 @@ defmodule Plug.Cache.Lookup do
 
   defp lookup_entry(conn, opts, entry) do
     if fresh_enough?(entry, conn, opts) do
-      record(conn, "fresh") |> serve_fresh(opts, entry)
+      record(conn, "fresh") |> serve_fresh(entry)
     else
       record(conn, "stale") |> validate(opts, entry)
     end
@@ -58,13 +58,59 @@ defmodule Plug.Cache.Lookup do
     max_age && max_age > ResponseLogic.age(entry)
   end
 
-  defp serve_fresh(conn, opts, entry) do
+  defp serve_fresh(conn, entry) do
     age = ResponseLogic.age(entry)
     entry = %{ entry | headers: Map.put(entry.headers, "Age", "#{age}") }
+    conn_from_response(conn, entry)
   end
 
-  defp validate(conn, opts, entry) do
+  defp validate(%Plug.Conn{req_headers: req_headers} = conn, opts, entry) do
+    cached_etags = String.split(entry["Etag"], ~r/\s*,\s*/)
+    request_etags = get_req_header(conn, "If-None-Match") |> Enum.join(",") |> String.split(~r/\s*,\s*/)
+    etags = Enum.uniq(cached_etags ++ request_etags)
+    etags = if Enum.empty?(etags), do: nil, else: Enum.join(", ")
 
+    # Make sure the method is not HEAD. We want the body content.
+    conn = %{ conn | method: "GET" }
+    # Add our cached etag validator to the environment.
+    # We keep the etags from the client to handle the case when the client
+    # has a different private valid entry which is not cached here.
+    conn = %{ conn | req_headers: Dict.put(req_headers, "If-None-Match", etags) }
+    # Used cached last modified
+    %{ conn | req_headers: Dict.put(req_headers, "If-Modified-Since", entry["Last-Modified"]) }
+    |> register_before_send(&finish_validate(&1, opts, entry, cached_etags, request_etags))
+  end
+
+  defp finish_validate(%Plug.Conn{status: 304} = conn, opts, entry, cached_etags, request_etags) do
+    conn = put_private(conn, :plug_cache_trace, conn.private[:plug_cache_trace] ++ ["valid"])
+    etag = conn.resp_headers["Etag"]
+
+    # Check if the response validated which is not cached here
+    if etag && Enum.member?(request_etags, etag) && !Enum.member?(cached_etags, etag) do
+      conn
+    else
+      finish_validate(conn, opts, entry)
+    end
+  end
+
+  defp finish_validate(conn, opts, _entry, _, _) do
+    conn
+    |> put_private(:plug_cache_trace, conn.private[:plug_cache_trace] ++ ["invalidate"])
+    |> store_validation(opts, response_from_conn(conn))
+  end
+
+  defp finish_validate(conn, opts, entry) do
+    entry = Map.delete(entry, "Date")
+    entry = Map.reduce(~w(Date Expires Cache-Control ETag Last-Modified), entry, fn(header, acc) ->
+      if conn.resp_headers[header], do: Map.put(acc, header, conn.resp_headers[header]), else: acc
+    end)
+
+    store_validation(conn, opts, entry)
+  end
+
+  defp store_validation(conn, opts, entry) do
+    entry = if ResponseLogic.cacheable?(entry), do: store(conn, entry, opts), else: entry
+    conn_from_response(conn, entry)
   end
 
   # The cache missed or a reload is required. Forward the request to the
@@ -79,10 +125,7 @@ defmodule Plug.Cache.Lookup do
 
   defp finish_fetch(conn, opts) do
     response = response_from_conn(conn) |> clean_cache_control(opts)
-
-    if ResponseLogic.cacheable?(response) do
-      response = store(conn, response, opts)
-    end
+    response = if ResponseLogic.cacheable?(response), do: store(conn, response, opts), else: response
 
     conn_from_response(conn, response)
   end
@@ -131,7 +174,7 @@ defmodule Plug.Cache.Lookup do
   # Write the respose to the cache
   defp store(conn, response, opts) do
     response = strip_ignored_headers(response, opts)
-    {:ok, response, opts } = Storeage.store_response(conn, response, opts)
+    {:ok, response, _opts } = Storage.store_response(conn, response, opts)
     %{ response | headers: Map.put(response.headers, "Age", "#{ResponseLogic.age(response)}") }
   end
 

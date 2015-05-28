@@ -1,4 +1,4 @@
-defmodule Plug.Cache.Storeage do
+defmodule Plug.Cache.Storage do
   @moduledoc """
   Module for serilzing, getting, and putting into / out of the entitystore and
   metastore.
@@ -20,9 +20,39 @@ defmodule Plug.Cache.Storeage do
   alias Plug.Cache.Response
 
   @doc """
+  Locate a cached response for the request provided. Returns
+  a %Plug.Cache.Response{} if the cache hits or nil if no cache entry was found.
   """
-  def lookup(conn, opts) do
-    nil
+  def lookup(conn, %{ metastore: meta_store } = opts) do
+    cache_key = Key.generate(conn)
+
+    do_lookup(conn, opts, {:entries, Dict.get(meta_store, cache_key, [])})
+  end
+
+  defp do_lookup(_conn, _opts, {:entries, []}), do: nil
+
+  defp do_lookup(conn, opts, {:entries, entries}) do
+    req_headers = persisted_request(conn)
+    match = Enum.find entries, fn({req, res}) ->
+      requests_match?(res["Very"], req_headers, req)
+    end
+
+    do_lookup(opts, {:match, match})
+  end
+
+  defp do_lookup(_opts, {:match, nil}), do: nil
+
+  defp do_lookup(%{ entitystore: entity_store }, { :match, {_req, res} }) do
+    do_lookup(res, {:body, Dict.get(entity_store, res["X-Content-Digest"])})
+  end
+
+  # TODO the metastore referenced an entity that doesn't exist in
+  # the entitystore. we definitely want to return nil but we should
+  # also purge the entry from the meta-store when this is detected.
+  defp do_lookup(_res, {:body, nil}), do: nil
+
+  defp do_lookup(res, {:body, body}) do
+    restore_response(res, body)
   end
 
   @doc """
@@ -136,6 +166,15 @@ defmodule Plug.Cache.Storeage do
     |> Enum.all? fn(header) ->
       saved_req[header] == req[header]
     end
+  end
+
+  # Converts a stored response hash into a Response object. The caller
+  # is responsible for loading and passing the body if needed.
+  defp restore_response(res, body) do
+    status = Map.get(res, "X-Status") |> to_integer
+    res = Map.delete(res, "X-Status")
+
+    %Response{status: status, headers: res, body: body}
   end
 
   defp persisted_response(%Response{status: status, headers: headers}) do
